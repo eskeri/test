@@ -334,15 +334,30 @@ def _load_rest_channels_with_candidates(
         print("  Using instant aggregate cache read…")
         agg_token_count, agg_counts = agg_result
 
-        # Subtract focus counts on the fly: rest = aggregate - focus.
+        # rest = aggregate - focus. The focus counts passed in were computed
+        # under the focus filters (--focus-token-limit, --focus-video-contribute,
+        # focus duration, ...), but the aggregate was built under the cache's
+        # BASE filters (rest_args: args.token_limit, no per-video cap, base
+        # duration/live filters). Subtracting the focus counts directly can go
+        # negative (e.g. focus loaded 3.5M tokens while the cache only folded
+        # 500k for that channel). So recompute each focus channel's contribution
+        # under the exact cache filters and subtract THAT.
         rest_token_count = agg_token_count
-        for name in focus_names:
-            rest_token_count -= focus_tokens.get(name, 0)
-
         rest_counts = {n: Counter(agg_counts.get(n, {})) for n in ngram_sizes}
-        for name, fc in focus_counts.items():
+        if focus_names:
+            print(f"  Recomputing {len(focus_names)} focus channel(s) under cache filters for subtraction…")
+        for name in focus_names:
+            sub_result = get_channel_ngrams(
+                base_dir, name, rest_args, cache_dir, ngram_sizes, nlp,
+                verbose=False, use_base_filters=True, candidates=candidate_phrases,
+            )
+            if sub_result is None:
+                # Channel contributed nothing to the cache; nothing to subtract.
+                continue
+            sub_tokens, sub_counts = sub_result
+            rest_token_count -= sub_tokens
             for n in ngram_sizes:
-                bucket = fc.get(n, {})
+                bucket = sub_counts.get(n, {})
                 if not bucket:
                     continue
                 target = rest_counts[n]
