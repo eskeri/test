@@ -222,3 +222,55 @@ def _run_cache_prepopulation(args, base_dir, cache_dir, ngram_sizes, nlp):
         close_cache_connection(cache_dir)
 
     return 0
+
+def main() -> int:
+    args = parse_args()
+    base_dir = Path(__file__).resolve().parent.parent
+    output_path = (base_dir / args.output_html).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_dir = base_dir / "cache" / "leaderboard"
+    ngram_sizes = list(range(1, args.ngram_max + 1))
+
+    # Lemmatizer setup
+    nlp = None
+    if args.lemmatize:
+        lemmatizer_type = args.lemmatizer
+        try:
+            if lemmatizer_type == "simplemma":
+                if simplemma is None:
+                    raise RuntimeError("simplemma not installed.")
+                print("Lemmatization enabled (simplemma)")
+                nlp = "simplemma"
+            else:  # spacy
+                if spacy is None:
+                    raise RuntimeError("spaCy not installed.")
+                nlp = spacy.load("en_core_web_sm", disable=["parser", "ner", "textcat", "senter"])
+                print("Lemmatization enabled (spaCy)")
+        except Exception as e:
+            print(f"Lemmatizer failed: {e}")
+            return 1
+
+    # --- Mode dispatch -------------------------------------------------------
+    if args.ttr_zscore:
+        return run_ttr_zscore(args, base_dir, cache_dir, nlp)
+
+    if not args.focus:
+        if not args.cache:
+            print("Error: --focus is required unless --ttr-zscore or --cache is set.")
+            return 1
+        return _run_cache_prepopulation(args, base_dir, cache_dir, ngram_sizes, nlp)
+
+    # Normal focus comparison
+    for fc in args.focus:
+        if fc not in args.channels:
+            print(f"Adding focus channel '{fc}' to channels list")
+            args.channels.append(fc)
+
+    if args.second_focus:
+        return run_two_channel_comparison(args, base_dir, cache_dir, ngram_sizes, nlp)
+    else:
+        return run_single_focus_comparison(args, base_dir, cache_dir, ngram_sizes, nlp)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
