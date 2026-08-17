@@ -133,17 +133,32 @@ def compute_scores(
             variance = (1.0 / smoothed_focus) + (1.0 / denom_focus) + (1.0 / smoothed_rest) + (1.0 / denom_rest)
             z_score_array = np.divide(log_odds_array, np.sqrt(variance), out=np.zeros_like(log_odds_array), where=variance > 0)
         else:
-            # Use original Monroe calculation with m_w scaling
-            total_word_counts = focus_count_array + rest_count_array
-            m_w_array = total_word_counts / total_tokens_all if total_tokens_all > 0 else np.zeros_like(focus_count_array)
+            # Monroe log-odds with informative Dirichlet prior.
+            # m_w = P(w) estimated from the rest pool (the background corpus),
+            # NOT from focus+rest. This is what makes rare words that the focus
+            # shares with the rest pool score lower than truly focus-exclusive words.
+            if rest_token_count > 0:
+                m_w_array = rest_count_array / rest_token_count
+            else:
+                m_w_array = np.zeros_like(focus_count_array)
             
             numer_focus = focus_count_array + alpha_total * m_w_array
             denom_focus = focus_token_count + alpha_total - numer_focus
-            odds_focus = np.divide(numer_focus, denom_focus, out=np.full_like(numer_focus, 1e9), where=denom_focus > 0)
-            
+            # Floor numerators at a tiny epsilon so a phrase absent from rest
+            # (m_w = 0 -> numer = 0) doesn't yield odds = 0 -> log(0) = -inf.
+            # The 1e9 "infinite odds" fill stays for the degenerate denom<=0 case.
+            eps = 1e-10
+            odds_focus = np.divide(
+                np.maximum(numer_focus, eps), denom_focus,
+                out=np.full_like(numer_focus, 1e9), where=denom_focus > 0,
+            )
+
             numer_rest = rest_count_array + alpha_total * m_w_array
             denom_rest = rest_token_count + alpha_total - numer_rest
-            odds_rest = np.divide(numer_rest, denom_rest, out=np.full_like(numer_rest, 1e9), where=denom_rest > 0)
+            odds_rest = np.divide(
+                np.maximum(numer_rest, eps), denom_rest,
+                out=np.full_like(numer_rest, 1e9), where=denom_rest > 0,
+            )
             
             log_odds_array = np.log(odds_focus) - np.log(odds_rest)
             
