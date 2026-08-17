@@ -102,7 +102,24 @@ def close_cache_connection(cache_dir=None):
 
 
 def cache_exists(cache_dir, channel, filter_hash):
-    """Check if a channel has been folded into the aggregate cache."""
+    """Check if a channel has been folded into the aggregate cache.
+
+    During a batch (--cache run) the in-memory accumulator is authoritative, so
+    we check it first and avoid re-reading the whole pickle from disk for every
+    channel (which made re-runs over hundreds of channels O(N^2) in reads even
+    though every channel was already cached). On the first read during a batch
+    we memoize the loaded index back into the batch so subsequent calls hit
+    memory.
+    """
+    if _batch is not None:
+        key = (cache_dir, filter_hash)
+        index = _batch.get(key)
+        if index is None:
+            index = load_index(cache_dir, filter_hash)
+            _batch[key] = index if index is not None else _new_index()
+        if index is None:
+            return False
+        return channel in index.get("channels", {})
     index = load_index(cache_dir, filter_hash)
     if index is None:
         return False
