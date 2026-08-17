@@ -7,8 +7,9 @@ from typing import Dict, List, Optional, Tuple, Iterator
 
 from .cache_hashes import _base_filters_hash, _filters_hash
 from .cache_io_simple import (
-    read_channel_cache,
     write_channel_cache,
+    write_channel_counts,
+    cache_exists,
 )
 
 
@@ -161,47 +162,27 @@ def get_channel_ngrams(
 ):
     """Return n-gram counts for *channel*.
 
-    Read path: try the per-channel cache file first (one sequential
-    decompress, no seeking - "instant" in the sense that it's a single
-    linear read of one file).
+    The cache is a dumb aggregate over ALL channels combined, so it cannot
+    return a single channel's counts. Therefore this function always counts
+    a single channel from its transcripts in memory.
 
-    Write path (when args.cache is set and candidates is None, i.e. we're
-    caching the *full* channel, not a candidate-filtered subset): stream
-    tokens straight to disk in bounded-size chunks and merge them into one
-    compressed cache file. Peak memory for this path does not grow with
-    channel size - a channel with 50M tokens takes the same peak memory as
-    one with 50K tokens (see cache_io.CHUNK_TOKEN_LIMIT). This is what
-    makes `--cache` safe to run over a 1500+ channel / billions-of-tokens
-    dataset on a laptop.
+    Write path (when args.cache is set and candidates is None): the counted
+    n-grams are folded into the single global aggregate pickle via
+    cache_io.write_channel_counts. During a --cache run the caller wraps the
+    loop in begin_cache_batch / flush_cache_batch so the aggregate is loaded
+    once and written once, not re-read/re-written per channel.
     """
     filter_hash = _base_filters_hash(args) if use_base_filters else _filters_hash(args)
 
-    # 1 - try cache first with requested hash
-    cached = read_channel_cache(cache_dir, channel, filter_hash)
-    
-    # 1.5 - if not found and using focus filters without per-video limiting, try base hash for compatibility
-    focus_video_contribute = getattr(args, "focus_video_contribute", None)
-    if cached is None and not use_base_filters and focus_video_contribute is None:
-        base_hash = _base_filters_hash(args)
-        cached = read_channel_cache(cache_dir, channel, base_hash)
-        if cached is not None:
-            print(f"  {channel}: using base-filter cache (focus filters not cached)")
-    
-    if cached is not None:
-        cached_token_count, cached_data = cached
-        if all(n in cached_data for n in ngram_sizes):
-            if args.token_limit > 0 and cached_token_count > args.token_limit:
-                if verbose:
-                    print(f"  {channel}: cached ({cached_token_count:,} tokens) exceeds "
-                          f"limit ({args.token_limit:,}), recomputing…")
-            else:
-                result = {n: Counter(cached_data.get(n, {})) for n in ngram_sizes}
-                if verbose:
-                    unique = sum(len(c) for c in result.values())
-                    print(f"  {channel}: instant cache hit ({cached_token_count:,} tokens, {unique:,} unique)")
-                return cached_token_count, result
+    # --cache mode skips channels already folded into the aggregate.
+    should_write_cache = getattr(args, "cache", False) and candidates is None
+    if should_write_cache and cache_exists(cache_dir, channel, filter_hash):
+        if verbose:
+            print(f"  {channel}: already in aggregate cache, skipping")
+        # Caller (cache prepopulation) only needs a token count; return 0
+        # tokens as a signal that it was already cached.
+        return 0, {n: Counter() for n in ngram_sizes}
 
-    # 2 - compute
     if verbose:
         print(f"  {channel}: computing n-grams…", end=" ", flush=True)
 
@@ -211,28 +192,7 @@ def get_channel_ngrams(
             print("no tokens")
         return None
 
-    should_write_cache = getattr(args, "cache", False) and candidates is None
-
-    if should_write_cache:
-        # Stream to simple cache format
-        pairs = _ngram_pairs_from_token_stream(token_stream, ngram_sizes)
-        token_count = write_channel_cache(cache_dir, channel, filter_hash, pairs)
-        if token_count == 0:
-            if verbose:
-                print("no tokens")
-            return None
-        if verbose:
-            print(f"done ({token_count:,} tokens) [cached]")
-        # Read the counts back so callers still get a result this run
-        cached_data = read_channel_cache(cache_dir, channel, filter_hash)
-        if cached_data is None:
-            return token_count, {n: Counter() for n in ngram_sizes}
-        _, data = cached_data
-        result = {n: Counter(data.get(n, {})) for n in ngram_sizes}
-        return token_count, result
-
-    # In-memory path: either not caching, or this is a candidate-filtered
-    # read, whose memory footprint is bounded by the candidate set size.
+    # Count once in memory (bounded by this channel's vocabulary).
     pair_result = _compute_ngrams_from_pair_streaming(token_stream, ngram_sizes, candidates)
     if pair_result is None:
         if verbose:
@@ -240,7 +200,19 @@ def get_channel_ngrams(
         return None
 
     token_count, ngram_counts = pair_result
-    if verbose:
-        unique = sum(len(c) for c in ngram_counts.values())
-        print(f"done ({token_count:,} tokens, {unique:,} unique)")
+
+    if should_write_cache:
+        # Fold the counted dict straight into the aggregate (no re-streaming).
+        write_channel_counts(
+            cache_dir, channel, filter_hash,
+            {n: dict(c) for n, c in ngram_counts.items()},
+            token_count,
+        )
+        if verbose:
+            print(f"done ({token_count:,} tokens) [cached]")
+    else:
+        if verbose:
+            unique = sum(len(c) for c in ngram_counts.values())
+            print(f"done ({token_count:,} tokens, {unique:,} unique)")
+
     return token_count, ngram_counts

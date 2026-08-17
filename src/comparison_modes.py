@@ -248,14 +248,35 @@ def _load_rest_channels_with_candidates(
     nlp=None,
     candidate_phrases=None,
 ):
-    """Load rest channels, using the global aggregate when available.
+    """Load the rest pool, using the dumb global aggregate when available.
 
-    With the global aggregate, the rest pool is computed by subtracting
-    focus channels' base-filter counts from the aggregate. This is nearly
-    instantaneous and does not require loading per-channel files.
+    The aggregate cache holds the combined counts for ALL channels (focus
+    included). The rest pool = aggregate - focus, so the focus channel counts
+    (already in memory in the caller) are subtracted on the fly here.
+
+    Args:
+        focus_channels: either a list of channel names, or a dict
+            {name: (token_count, {n: {phrase: count}})} carrying the actual
+            focus counts so they can be subtracted. A plain list still works
+            (no subtraction, old behavior) but subtraction is what makes the
+            rest pool correct.
     """
+    # Normalize focus_channels into (focus_names, focus_counts, focus_tokens).
+    if isinstance(focus_channels, dict):
+        focus_names = list(focus_channels.keys())
+        focus_counts = {
+            name: counts for name, (_tc, counts) in focus_channels.items()
+        }
+        focus_tokens = {
+            name: tc for name, (tc, _counts) in focus_channels.items()
+        }
+    else:
+        focus_names = list(focus_channels or [])
+        focus_counts = {}
+        focus_tokens = {}
+
     rest_args = argparse.Namespace(**vars(args))
-    # Reset focus‑specific filters
+    # Reset focus-specific filters
     rest_args.date_from = args.date_from
     rest_args.date_to = getattr(args, "date_to", "")
     rest_args.duration_from = args.duration_from
@@ -273,7 +294,7 @@ def _load_rest_channels_with_candidates(
     rest_args.second_focus_duration_to = ""
     rest_args.second_focus_exclude_live = False
 
-    focus_set = set(focus_channels or [])
+    focus_set = set(focus_names)
     rest_counts = {n: Counter() for n in ngram_sizes}
     rest_token_count = 0
     rest_channels_used = []
@@ -293,24 +314,44 @@ def _load_rest_channels_with_candidates(
 
     filter_hash = _base_filters_hash(rest_args)
 
-    # Try instant aggregate read first
+    # Try instant aggregate read first. The aggregate includes the focus
+    # channel; we subtract its counts on the fly below.
     agg_result = read_aggregate_filtered(
-        cache_dir, filter_hash, candidate_phrases or {}, focus_channels
+        cache_dir, filter_hash, candidate_phrases or {}
     )
-    
+
     # If not found, try with the original args hash (might have focus-specific params)
     if agg_result is None:
         original_hash = _base_filters_hash(args)
         if original_hash != filter_hash:
             agg_result = read_aggregate_filtered(
-                cache_dir, original_hash, candidate_phrases or {}, focus_channels
+                cache_dir, original_hash, candidate_phrases or {}
             )
             if agg_result is not None:
                 print("  Using original args cache (different filter hash)")
 
     if agg_result is not None:
         print("  Using instant aggregate cache read…")
-        rest_token_count, rest_counts = agg_result
+        agg_token_count, agg_counts = agg_result
+
+        # Subtract focus counts on the fly: rest = aggregate - focus.
+        rest_token_count = agg_token_count
+        for name in focus_names:
+            rest_token_count -= focus_tokens.get(name, 0)
+
+        rest_counts = {n: Counter(agg_counts.get(n, {})) for n in ngram_sizes}
+        for name, fc in focus_counts.items():
+            for n in ngram_sizes:
+                bucket = fc.get(n, {})
+                if not bucket:
+                    continue
+                target = rest_counts[n]
+                for phrase, c in bucket.items():
+                    if phrase in target:
+                        target[phrase] -= c
+                        if target[phrase] <= 0:
+                            del target[phrase]
+
         rest_channels_used = rest_channels  # all rest channels are considered used
         ngram_hits = len(rest_channels_used)
         skipped = 0
@@ -333,18 +374,17 @@ def _load_rest_channels_with_candidates(
             skipped,
         )
 
-    # Fallback: simple sequential filtered reads (no threading)
-    print("  Streaming candidate-filtered cache reads (sequential)…")
-    channel_data = read_multiple_channels_filtered(
-        cache_dir, rest_channels, filter_hash, candidate_phrases or {}
-    )
-
+    # Fallback: recompute per rest channel from transcripts (no aggregate cache).
+    print("  No aggregate cache; streaming per-channel reads (sequential)…")
     for channel in rest_channels:
-        data = channel_data.get(channel)
-        if data is None:
+        result = get_channel_ngrams(
+            base_dir, channel, rest_args, cache_dir, ngram_sizes, nlp,
+            verbose=False, use_base_filters=True, candidates=candidate_phrases,
+        )
+        if result is None:
             skipped += 1
             continue
-        token_count, channel_counts = data
+        token_count, channel_counts = result
         rest_token_count += token_count
         rest_channels_used.append(channel)
         ngram_hits += 1
@@ -695,7 +735,12 @@ def run_single_focus_comparison(
     print("\n[Pass 2] Loading comparison channels...")
     rest_counts, rest_counts_full, rest_token_count, rest_channel_count, \
     rest_channels_used, ngram_hits, skipped = _load_rest_channels_with_candidates(
-        base_dir, args, cache_dir, ngram_sizes, valid_focus, nlp,
+        base_dir, args, cache_dir, ngram_sizes,
+        {
+            fc: (focus_token_counts[fc], focus_ngram_counts[fc])
+            for fc in valid_focus
+        },
+        nlp,
         candidate_phrases=candidate_phrases,
     )
 

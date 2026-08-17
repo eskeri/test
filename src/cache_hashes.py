@@ -21,6 +21,7 @@ def _base_filters_hash(args) -> str:
         "min_tokens_total": args.min_tokens_total,
         "lemmatize": bool(getattr(args, "lemmatize", False)),
         "lemmatizer": getattr(args, "lemmatizer", "simplemma"),
+        "ngram_max": getattr(args, "ngram_max", 2),
     }, sort_keys=True)
     return hashlib.sha1(key.encode()).hexdigest()[:16]
 
@@ -39,6 +40,7 @@ def _filters_hash(args) -> str:
         "min_tokens_total": args.min_tokens_total,
         "lemmatize": bool(getattr(args, "lemmatize", False)),
         "lemmatizer": getattr(args, "lemmatizer", "simplemma"),
+        "ngram_max": getattr(args, "ngram_max", 2),
         "focus_date_from": getattr(args, "focus_date_from", ""),
         "focus_date_to": getattr(args, "focus_date_to", ""),
         "focus_duration_from": getattr(args, "focus_duration_from", ""),

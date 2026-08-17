@@ -34,7 +34,7 @@ from .comparison_modes import (
 )
 from .token_loading import _discover_channels
 from .cache_hashes import _base_filters_hash
-from .cache_io import close_cache_connection
+from .cache_io import close_cache_connection, begin_cache_batch
 
 
 def parse_args() -> argparse.Namespace:
@@ -183,30 +183,25 @@ def parse_args() -> argparse.Namespace:
 
 
 def _run_cache_prepopulation(args, base_dir, cache_dir, ngram_sizes, nlp):
-    """Cache every channel's n-grams to disk, folding each one into the
-    single global aggregate file as we go - not as one giant merge at the
-    very end. This is the only mode this function handles - it does not do
-    any focus/rest comparison or write any HTML output.
+    """Cache every channel's n-grams, folding each into the dumb aggregate.
 
-    Memory: each channel is streamed to the aggregate file in bounded-size
-    chunks (see cache_io.write_channel_cache_chunked), so peak memory does
-    not grow with channel size or with the number of channels processed.
-    Only one channel is ever "in flight" at a time in this loop.
-
-    Resumability: with the new single-file-per-filter structure, channels are
-    appended directly to the aggregate file with offset tracking. If this run
-    gets interrupted, re-running the same command later picks up where it left
-    off - already-cached channels are read straight from the aggregate file
-    using their stored offsets.
+    Each channel's tokens are counted in memory and folded into one global
+    aggregate pickle (cache_{filter_hash}.pkl). To avoid re-reading and
+    re-writing the whole growing pickle for every channel (O(N^2)), the whole
+    run is wrapped in a single batch: the aggregate is loaded once at the
+    start and written once at the end. Channels already folded are skipped,
+    so re-running after an interruption picks up where it left off.
     """
     from .ngram_counting import get_channel_ngrams
 
     # Use specific channels if provided, otherwise use all channels
     channels_to_cache = args.cache_channels if args.cache_channels else args.channels
-    
+
     print(f"Pre-populating caches for {len(channels_to_cache)} channels…")
     filter_hash = _base_filters_hash(args)
 
+    # One read at the start, one write at the end -- not per channel.
+    begin_cache_batch()
     try:
         for idx, channel in enumerate(channels_to_cache, 1):
             result = get_channel_ngrams(
@@ -218,61 +213,12 @@ def _run_cache_prepopulation(args, base_dir, cache_dir, ngram_sizes, nlp):
                 continue
 
             tc, _ = result
+            if tc == 0:
+                print(f"  {idx:>4}/{len(channels_to_cache)}  {channel}: already cached, skipping")
+                continue
             print(f"  {idx:>4}/{len(channels_to_cache)}  {channel}: {tc:,} tokens → cached")
     finally:
+        # Flushes the in-memory aggregate to the single pickle file.
         close_cache_connection(cache_dir)
 
     return 0
-
-
-def main() -> int:
-    args = parse_args()
-    base_dir = Path(__file__).resolve().parent.parent
-    output_path = (base_dir / args.output_html).resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_dir = base_dir / "cache" / "leaderboard"
-    ngram_sizes = list(range(1, args.ngram_max + 1))
-
-    # Lemmatizer setup
-    nlp = None
-    if args.lemmatize:
-        lemmatizer_type = args.lemmatizer
-        try:
-            if lemmatizer_type == "simplemma":
-                if simplemma is None:
-                    raise RuntimeError("simplemma not installed.")
-                print("Lemmatization enabled (simplemma)")
-                nlp = "simplemma"
-            else:  # spacy
-                if spacy is None:
-                    raise RuntimeError("spaCy not installed.")
-                nlp = spacy.load("en_core_web_sm", disable=["parser", "ner", "textcat", "senter"])
-                print("Lemmatization enabled (spaCy)")
-        except Exception as e:
-            print(f"Lemmatizer failed: {e}")
-            return 1
-
-    # --- Mode dispatch -------------------------------------------------------
-    if args.ttr_zscore:
-        return run_ttr_zscore(args, base_dir, cache_dir, nlp)
-
-    if not args.focus:
-        if not args.cache:
-            print("Error: --focus is required unless --ttr-zscore or --cache is set.")
-            return 1
-        return _run_cache_prepopulation(args, base_dir, cache_dir, ngram_sizes, nlp)
-
-    # Normal focus comparison
-    for fc in args.focus:
-        if fc not in args.channels:
-            print(f"Adding focus channel '{fc}' to channels list")
-            args.channels.append(fc)
-
-    if args.second_focus:
-        return run_two_channel_comparison(args, base_dir, cache_dir, ngram_sizes, nlp)
-    else:
-        return run_single_focus_comparison(args, base_dir, cache_dir, ngram_sizes, nlp)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -2,7 +2,8 @@
 
 # Cache versioning
 # Increment this number when cache semantics change (tokenization, lemmatization, etc.)
-CACHE_VERSION = 3
+# v4: cache switched to a single dumb aggregate (no per-channel breakdown).
+CACHE_VERSION = 4
 
 # Cache only n-grams of size 1 through 5 to disk
 # Higher-order n-grams are computed on the fly to save disk space
