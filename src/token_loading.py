@@ -108,7 +108,7 @@ def stream_tokens(
 
             for token in tokens:
                 token_count += 1
-                yield token.lower()
+                yield token  # tokenize() already lowercases
 
                 if args.token_limit > 0 and token_count >= args.token_limit:
                     return
