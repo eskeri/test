@@ -3,7 +3,10 @@
 # Cache versioning
 # Increment this number when cache semantics change (tokenization, lemmatization, etc.)
 # v4: cache switched to a single dumb aggregate (no per-channel breakdown).
-CACHE_VERSION = 4
+# v5: cache backend switched from one in-memory pickle to an indexed SQLite
+#      file per filter hash, so reads/membership stay instant at multi-billion-
+#      word corpus scale instead of loading the whole aggregate into RAM.
+CACHE_VERSION = 5
 
 # Cache only n-grams of size 1 through 5 to disk
 # Higher-order n-grams are computed on the fly to save disk space

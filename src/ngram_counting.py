@@ -167,7 +167,7 @@ def get_channel_ngrams(
     a single channel from its transcripts in memory.
 
     Write path (when args.cache is set and candidates is None): the counted
-    n-grams are folded into the single global aggregate pickle via
+    n-grams are folded into the single global aggregate cache via
     cache_io.write_channel_counts. During a --cache run the caller wraps the
     loop in begin_cache_batch / flush_cache_batch so the aggregate is loaded
     once and written once, not re-read/re-written per channel.
