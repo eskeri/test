@@ -186,10 +186,10 @@ def _run_cache_prepopulation(args, base_dir, cache_dir, ngram_sizes, nlp):
     """Cache every channel's n-grams, folding each into the dumb aggregate.
 
     Each channel's tokens are counted in memory and folded into one global
-    aggregate pickle (cache_{filter_hash}.pkl). To avoid re-reading and
-    re-writing the whole growing pickle for every channel (O(N^2)), the whole
-    run is wrapped in a single batch: the aggregate is loaded once at the
-    start and written once at the end. Channels already folded are skipped,
+    aggregate cache (cache_{filter_hash}.db). To avoid re-reading and
+    re-writing the whole growing cache for every channel (O(N^2)), the whole
+    run is wrapped in a single batch: writes are folded into one open
+    transaction and committed once at the end. Channels already folded are skipped,
     so re-running after an interruption picks up where it left off.
     """
     from .ngram_counting import get_channel_ngrams
@@ -218,7 +218,7 @@ def _run_cache_prepopulation(args, base_dir, cache_dir, ngram_sizes, nlp):
                 continue
             print(f"  {idx:>4}/{len(channels_to_cache)}  {channel}: {tc:,} tokens → cached")
     finally:
-        # Flushes the in-memory aggregate to the single pickle file.
+        # Flushes the batched aggregate writes to the cache database.
         close_cache_connection(cache_dir)
 
     return 0
