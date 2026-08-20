@@ -126,25 +126,66 @@ def _make_token_stream(base_dir, channel, args, nlp):
     if not need_lemmatise:
         return raw_stream
 
-    from .lemmatization import _lemmatize_token, _lemmatize_token_simplemma
+    from .lemmatization import _lemmatize_token_simplemma, _lemmatize_token
     lemma_cache = {}
+    
+    # Batch lemmatization for better performance
+    # Instead of calling lemmatizer on each token individually, accumulate
+    # tokens and process in batches to reduce Python function call overhead
+    BATCH_SIZE = 1000
+    
+    def batch_lemmatiser(tokens, lemmatiser_func):
+        """Lemmatize a batch of tokens, using cache for repeats."""
+        # Pre-allocate result list with None for all tokens
+        result = [None] * len(tokens)
+        uncached = []
+        uncached_indices = []
+        
+        for i, token in enumerate(tokens):
+            cached = lemma_cache.get(token)
+            if cached is not None:
+                result[i] = cached
+            else:
+                uncached.append(token)
+                uncached_indices.append(i)
+        
+        # Process uncached tokens in bulk
+        if uncached:
+            if lemmatiser_func == _lemmatize_token_simplemma:
+                # simplemma: process individually but in a tight loop
+                lemmas = [_lemmatize_token_simplemma(t) for t in uncached]
+            else:
+                # spacy: process individually
+                lemmas = [lemmatiser_func(t) for t in uncached]
+            
+            for j, (idx, lemma) in enumerate(zip(uncached_indices, lemmas)):
+                lemma_cache[uncached[j]] = lemma
+                result[idx] = lemma
+        
+        return result
+    
     lemmatiser = (
-        (lambda t: _lemmatize_token_simplemma(t)) if nlp == "simplemma"
+        _lemmatize_token_simplemma if nlp == "simplemma"
         else (lambda t: _lemmatize_token(t, nlp))
     )
 
-    def cached_lemmatiser(token):
-        cached = lemma_cache.get(token)
-        if cached is None:
-            cached = lemmatiser(token)
-            lemma_cache[token] = cached
-        return cached
-
     def decorated():
+        batch = []
         for token in raw_stream:
             if token is None:
                 continue
-            yield (cached_lemmatiser(token), token)
+            batch.append(token)
+            if len(batch) >= BATCH_SIZE:
+                lemmas = batch_lemmatiser(batch, lemmatiser)
+                for t, l in zip(batch, lemmas):
+                    yield (l, t)
+                batch = []
+        
+        # Process remaining tokens in the final batch
+        if batch:
+            lemmas = batch_lemmatiser(batch, lemmatiser)
+            for t, l in zip(batch, lemmas):
+                yield (l, t)
 
     return decorated()
 
