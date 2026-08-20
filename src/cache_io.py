@@ -269,7 +269,7 @@ def _fold_into_conn(conn, channel, token_count, counts):
             continue
         conn.executemany(
             "INSERT INTO counts(n, phrase, count) VALUES (?, ?, ?) "
-            "ON CONFLICT(n, phrase) DO UPDATE SET count = counts.count + excluded.count",
+            "ON CONFLICT(n, phrase) DO UPDATE SET count = count + excluded.count",
             [(n, phrase, c) for phrase, c in bucket.items()],
         )
     # Update running totals (atomic increment).
