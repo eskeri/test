@@ -402,7 +402,7 @@ def read_aggregate_filtered(cache_dir, filter_hash, target_phrases, exclude_chan
     This returns that total filtered to the candidate phrases; the caller
     subtracts the focus channel's counts on the fly to get the rest pool.
 
-    This is an indexed point lookup (one query per n), so it returns in
+    This is an indexed point lookup (batched queries per n), so it returns in
     milliseconds regardless of corpus size and only loads the requested
     phrases into memory.
 
@@ -427,18 +427,28 @@ def read_aggregate_filtered(cache_dir, filter_hash, target_phrases, exclude_chan
         total_tokens = int(row["value"])
 
         aggregate_counts = {}
+        # Batch size for IN clauses - SQLite handles ~1000 parameters efficiently
+        BATCH_SIZE = 900
+        
         for n, phrases in target_phrases.items():
             if not phrases:
                 continue
-            # Use a parameterized IN (...) with qmark placeholders.
-            phrases = list(phrases)
-            placeholders = ",".join("?" for _ in phrases)
-            rows = conn.execute(
-                f"SELECT phrase, count FROM counts WHERE n=? AND phrase IN ({placeholders})",
-                [n, *phrases],
-            ).fetchall()
-            if rows:
-                aggregate_counts[n] = {r["phrase"]: r["count"] for r in rows}
+            phrases_list = list(phrases)
+            results_for_n = {}
+            
+            # Process in batches to avoid huge IN clauses
+            for i in range(0, len(phrases_list), BATCH_SIZE):
+                batch = phrases_list[i:i + BATCH_SIZE]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"SELECT phrase, count FROM counts WHERE n=? AND phrase IN ({placeholders})",
+                    [n, *batch],
+                ).fetchall()
+                for r in rows:
+                    results_for_n[r["phrase"]] = r["count"]
+            
+            if results_for_n:
+                aggregate_counts[n] = results_for_n
 
         return total_tokens, aggregate_counts
     finally:
