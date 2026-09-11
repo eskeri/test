@@ -35,6 +35,13 @@ from .comparison_modes import (
 from .token_loading import _discover_channels
 from .cache_hashes import _base_filters_hash
 from .cache_io import close_cache_connection, begin_cache_batch
+from .observation import run_observation, add_observation_args
+from .candidate_cache import (
+    get_candidate_cache_key,
+    add_channel_candidates,
+    begin_candidate_cache_batch,
+    end_candidate_cache_batch,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,6 +49,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Discover which words/phrases a YouTube channel uses more than all others."
     )
+    
+    # Add observation feature arguments
+    add_observation_args(p)
 
     # Channel selection
     p.add_argument("channels", nargs="*", help="Channel folder names. Defaults to all under data/input.")
@@ -179,6 +189,11 @@ def parse_args() -> argparse.Namespace:
                     print(f"Adding prior channel '{pc}' to channels list")
                     args.channels.append(pc)
 
+    # Validate observation mode
+    if getattr(args, "allow_observe", False):
+        if not args.observe_channel:
+            p.error("--observe-channel is required when using --allow-observe")
+
     return args
 
 
@@ -191,17 +206,26 @@ def _run_cache_prepopulation(args, base_dir, cache_dir, ngram_sizes, nlp):
     run is wrapped in a single batch: writes are folded into one open
     transaction and committed once at the end. Channels already folded are skipped,
     so re-running after an interruption picks up where it left off.
+    
+    Additionally, if candidate cache is enabled, we also store candidate phrases
+    (those meeting min_count threshold) in a separate disk-based cache for
+    incremental accumulation.
     """
     from .ngram_counting import get_channel_ngrams
 
     # Use specific channels if provided, otherwise use all channels
     channels_to_cache = args.cache_channels if args.cache_channels else args.channels
 
-    print(f"Pre-populating caches for {len(channels_to_cache)} channels…")
+    print(f"Pre-populating caches for {len(channels_to_cache)} channels\u2026")
     filter_hash = _base_filters_hash(args)
 
-    # One read at the start, one write at the end -- not per channel.
+    # Start both batch caches
     begin_cache_batch()
+    candidate_batch_conns = begin_candidate_cache_batch()
+    
+    # Get candidate cache key
+    cand_filter_hash, cand_ngram_max, cand_min_count = get_candidate_cache_key(args)
+
     try:
         for idx, channel in enumerate(channels_to_cache, 1):
             result = get_channel_ngrams(
@@ -212,16 +236,30 @@ def _run_cache_prepopulation(args, base_dir, cache_dir, ngram_sizes, nlp):
                 print(f"  {idx:>4}/{len(channels_to_cache)}  {channel}: FAILED (no tokens)")
                 continue
 
-            tc, _ = result
+            tc, ngram_counts = result
             if tc == 0:
                 print(f"  {idx:>4}/{len(channels_to_cache)}  {channel}: already cached, skipping")
                 continue
-            print(f"  {idx:>4}/{len(channels_to_cache)}  {channel}: {tc:,} tokens → cached")
+            
+            # Also add to candidate cache if enabled
+            if getattr(args, "cache", False):
+                new, updated = add_channel_candidates(
+                    cache_dir, channel, cand_filter_hash, cand_ngram_max, cand_min_count,
+                    ngram_counts, tc, candidate_batch_conns
+                )
+                if new > 0 or updated > 0:
+                    print(f"  {idx:>4}/{len(channels_to_cache)}  {channel}: {tc:,} tokens \u2192 cached ({new} new candidates, {updated} updated)")
+                else:
+                    print(f"  {idx:>4}/{len(channels_to_cache)}  {channel}: {tc:,} tokens \u2192 cached")
+            else:
+                print(f"  {idx:>4}/{len(channels_to_cache)}  {channel}: {tc:,} tokens \u2192 cached")
     finally:
         # Flushes the batched aggregate writes to the cache database.
         close_cache_connection(cache_dir)
+        end_candidate_cache_batch(candidate_batch_conns)
 
     return 0
+
 
 def main() -> int:
     args = parse_args()
@@ -251,12 +289,17 @@ def main() -> int:
             return 1
 
     # --- Mode dispatch -------------------------------------------------------
+    
+    # Check if observation mode is requested
+    if getattr(args, "allow_observe", False):
+        return run_observation(args, base_dir, cache_dir, ngram_sizes, nlp)
+    
     if args.ttr_zscore:
         return run_ttr_zscore(args, base_dir, cache_dir, nlp)
 
     if not args.focus:
         if not args.cache:
-            print("Error: --focus is required unless --ttr-zscore or --cache is set.")
+            print("Error: --focus is required unless --ttr-zscore, --cache, or --allow-observe is set.")
             return 1
         return _run_cache_prepopulation(args, base_dir, cache_dir, ngram_sizes, nlp)
 
