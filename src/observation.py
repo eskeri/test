@@ -5,24 +5,32 @@ This module implements the --allow-observe feature that allows users to:
 2. Check which phrases in specific videos were said in previous videos
 3. See phrases ranked by their fightin' words z-score
 
-The observation feature is designed to coexist with other features and
-not interfere with normal operation.
+The observation feature is designed to:
+- Use cached data from previous runs for fast analysis
+- Respect --focus-video-contribute limits
+- Coexist with other features without interference
 """
 
 import argparse
 import sqlite3
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 from .token_loading import _input_root, _load_metadata, _filter_files_by_metadata, stream_tokens, load_tokens_per_video
 from .utils import tokenize, extract_video_id
 from .scoring import PhraseScore, compute_scores, partition_scores
+from .ngram_counting import get_channel_ngrams
+from .cache_hashes import _filters_hash
+from .cache_io_simple import cache_exists, read_aggregate_filtered
 from .candidate_cache import (
     get_candidate_cache_key,
     get_channel_last_run_phrases,
     get_phrases_across_videos,
     store_video_phrases,
+    begin_candidate_cache_batch,
+    end_candidate_cache_batch,
+    add_channel_candidates,
     begin_candidate_cache_batch,
     end_candidate_cache_batch,
 )
@@ -209,6 +217,163 @@ def _compute_video_ngrams(
         return None
 
 
+def _get_focus_channel_candidates(
+    base_dir: Path,
+    channel: str,
+    args: argparse.Namespace,
+    cache_dir: Path,
+    ngram_sizes: List[int],
+    nlp=None,
+) -> Tuple[Optional[int], Optional[Dict[int, Dict[str, int]]]]:
+    """Get candidate phrases from focus channel using cached data or compute fresh.
+    
+    This tries to use the cache first, then falls back to computing from transcripts.
+    
+    Returns:
+        Tuple of (token_count, ngram_counts) or (None, None) if failed
+    """
+    # Try to get from cache first
+    filter_hash = _filters_hash(args)
+    
+    # Check if channel is in aggregate cache
+    if cache_exists(cache_dir, channel, filter_hash):
+        print(f"  {channel}: using cached n-grams")
+        result = get_channel_ngrams(
+            base_dir, channel, args, cache_dir, ngram_sizes, nlp,
+            verbose=False, use_base_filters=False,
+        )
+        if result is not None:
+            return result
+    
+    # Fallback: compute fresh
+    print(f"  {channel}: computing n-grams...")
+    result = get_channel_ngrams(
+        base_dir, channel, args, cache_dir, ngram_sizes, nlp,
+        verbose=True, use_base_filters=False,
+    )
+    return result
+
+
+def _get_rest_pool_counts(
+    base_dir: Path,
+    args: argparse.Namespace,
+    cache_dir: Path,
+    ngram_sizes: List[int],
+    candidate_phrases: Dict[int, Set[str]],
+    focus_channel: str,
+    focus_counts: Dict[int, Dict[str, int]],
+    focus_token_count: int,
+    nlp=None,
+) -> Tuple[Dict[int, Counter], int, List[str]]:
+    """Get rest pool counts using cached data when available.
+    
+    This uses the aggregate cache (which includes all channels) and subtracts
+    the focus channel's contribution.
+    
+    Returns:
+        Tuple of (rest_counts, rest_token_count, rest_channels_used)
+    """
+    from .cache_hashes import _base_filters_hash
+    from .cache_io_simple import read_aggregate_filtered, get_total_token_count
+    
+    # Build rest args (same as base args but without focus-specific filters)
+    rest_args = argparse.Namespace(**vars(args))
+    rest_args.focus_date_from = ""
+    rest_args.focus_date_to = ""
+    rest_args.focus_duration_from = ""
+    rest_args.focus_duration_to = ""
+    rest_args.focus_exclude_live = False
+    rest_args.focus_token_limit = None
+    rest_args.focus_video_contribute = None
+    rest_args.second_focus_date_from = ""
+    rest_args.second_focus_date_to = ""
+    rest_args.second_focus_duration_from = ""
+    rest_args.second_focus_duration_to = ""
+    rest_args.second_focus_exclude_live = False
+    
+    filter_hash = _base_filters_hash(rest_args)
+    
+    # Try to use aggregate cache
+    agg_result = read_aggregate_filtered(cache_dir, filter_hash, candidate_phrases)
+    
+    if agg_result is not None:
+        print("  Using instant aggregate cache for rest pool...")
+        agg_token_count, agg_counts = agg_result
+        
+        # Subtract focus channel contribution
+        rest_counts = {n: Counter(agg_counts.get(n, {})) for n in ngram_sizes}
+        rest_token_count = agg_token_count
+        
+        # Recompute focus under rest filters for accurate subtraction
+        focus_rest_result = get_channel_ngrams(
+            base_dir, focus_channel, rest_args, cache_dir, ngram_sizes, nlp,
+            verbose=False, use_base_filters=True, candidates=candidate_phrases,
+        )
+        
+        if focus_rest_result is not None:
+            sub_tokens, sub_counts = focus_rest_result
+            rest_token_count -= sub_tokens
+            for n in ngram_sizes:
+                bucket = sub_counts.get(n, {})
+                if not bucket:
+                    continue
+                target = rest_counts[n]
+                for phrase, c in bucket.items():
+                    if phrase in target:
+                        target[phrase] -= c
+                        if target[phrase] <= 0:
+                            del target[phrase]
+        
+        # Get all channels in aggregate
+        from .cache_io_simple import get_all_channels
+        all_cached_channels = get_all_channels(cache_dir, filter_hash)
+        rest_channels_used = [c for c in all_cached_channels if c != focus_channel]
+        
+        print(f"  Rest pool: {len(rest_channels_used)} channels from cache")
+        return rest_counts, rest_token_count, rest_channels_used
+    
+    # Fallback: use candidate cache
+    print("  No aggregate cache; trying candidate cache...")
+    cand_filter_hash, cand_ngram_max, cand_min_count = get_candidate_cache_key(rest_args)
+    cached_candidates = get_cached_candidates(
+        cache_dir, cand_filter_hash, cand_ngram_max, cand_min_count,
+        target_phrases=candidate_phrases
+    )
+    
+    if cached_candidates is not None:
+        print("  Using candidate cache for rest pool...")
+        _, cached_rest_counts = cached_candidates
+        
+        rest_counts = {n: Counter(cached_rest_counts.get(n, {})) for n in ngram_sizes}
+        rest_token_count = 0
+        
+        # Subtract focus channel
+        if focus_counts:
+            for n in ngram_sizes:
+                bucket = focus_counts.get(n, {})
+                if not bucket:
+                    continue
+                target = rest_counts[n]
+                for phrase, c in bucket.items():
+                    if phrase in target:
+                        target[phrase] -= c
+                        if target[phrase] <= 0:
+                            del target[phrase]
+        
+        from .candidate_cache import get_all_channels_in_cache
+        cached_channels = set(get_all_channels_in_cache(
+            cache_dir, cand_filter_hash, cand_ngram_max, cand_min_count
+        ))
+        rest_channels_used = [c for c in cached_channels if c != focus_channel]
+        
+        print(f"  Rest pool: {len(rest_channels_used)} channels from candidate cache")
+        return rest_counts, rest_token_count, rest_channels_used
+    
+    # Final fallback: empty rest pool
+    print("  No cache available; using empty rest pool")
+    return {n: Counter() for n in ngram_sizes}, 0, []
+
+
 def run_observation(
     args: argparse.Namespace,
     base_dir: Path,
@@ -219,8 +384,10 @@ def run_observation(
     """Run the observation feature.
     
     This function handles:
-    1. Displaying a channel's fightin' words from last run (if --observe-channel)
-    2. Showing which phrases in specific videos appear in previous videos (if --observe-video-ids)
+    1. Displaying a channel's fightin' ngrams from last run (if --observe-channel)
+    2. Checking which phrases in specific videos appear in previous videos (if --observe-video-ids)
+    
+    It uses cached data from previous runs for fast analysis.
     
     Args:
         args: Parsed arguments
@@ -250,10 +417,13 @@ def run_observation(
     channel = observe_args.observe_channel
     print(f"\nObserving channel: {channel}")
     
+    # Get max_contribute from focus_video_contribute
+    max_contribute = getattr(args, "focus_video_contribute", None)
+    
     # Get the cache key from the current args
     filter_hash, cache_ngram_max, cache_min_count = get_candidate_cache_key(args)
     
-    # Try to get the last run's phrases for this channel
+    # Try to get the last run's phrases for this channel from candidate cache
     print(f"\n[Looking for cached fightin' words from last run...]")
     last_run_phrases = get_channel_last_run_phrases(
         cache_dir, channel, filter_hash, cache_ngram_max, cache_min_count
@@ -270,13 +440,60 @@ def run_observation(
                 print(f"    '{phrase}': {count:,}")
     else:
         print("No cached phrases found from last run")
+        # Try to get focus channel data
+        print(f"  Loading focus channel data...")
+        focus_result = _get_focus_channel_candidates(
+            base_dir, channel, args, cache_dir, ngram_sizes, nlp
+        )
+        if focus_result[1] is not None:
+            focus_token_count, focus_ngram_counts = focus_result
+            print(f"  Focus channel: {focus_token_count:,} tokens, {sum(len(c) for c in focus_ngram_counts.values())} unique phrases")
+            
+            # Build candidate phrases from focus
+            candidate_phrases = {}
+            for n in ngram_sizes:
+                cand = set()
+                for phrase, cnt in focus_ngram_counts.get(n, Counter()).items():
+                    if cnt >= args.min_count:
+                        cand.add(phrase)
+                if cand:
+                    candidate_phrases[n] = cand
+            
+            # Get rest pool from cache
+            rest_counts, rest_token_count, rest_channels_used = _get_rest_pool_counts(
+                base_dir, args, cache_dir, ngram_sizes, candidate_phrases,
+                channel, focus_ngram_counts, focus_token_count, nlp
+            )
+            
+            # Compute scores
+            print(f"\n[Computing scores...]")
+            all_scores = compute_scores(
+                focus_ngram_counts, focus_token_count,
+                rest_counts, rest_token_count,
+                ngram_sizes, args.min_count, args.alpha, args.no_logs_under,
+                args.alpha_total, args.size_proportional_prior,
+            )
+            by_n = partition_scores(all_scores, args.top_n, args.show_exclusive_in_distinct)
+            
+            # Cache the candidate phrases for future use
+            from .candidate_cache import add_channel_candidates, begin_candidate_cache_batch, end_candidate_cache_batch
+            batch_conns = begin_candidate_cache_batch()
+            try:
+                add_channel_candidates(
+                    cache_dir, channel, filter_hash, cache_ngram_max, cache_min_count,
+                    focus_ngram_counts, focus_token_count, batch_conns
+                )
+            finally:
+                end_candidate_cache_batch(batch_conns)
+            
+            print(f"  Cached {sum(len(c) for c in candidate_phrases.values())} candidate phrases")
+            
+            # Store for observation
+            last_run_phrases = focus_ngram_counts
     
     # Handle video-specific observation
     if observe_args.observe_video_ids:
         print(f"\n[Checking phrases across videos...]")
-        
-        # Get max_contribute from focus_video_contribute
-        max_contribute = getattr(args, "focus_video_contribute", None)
         
         # Load all videos for this channel
         videos_info = _load_channel_videos_info(base_dir, channel, args)
@@ -289,7 +506,7 @@ def run_observation(
         # Get video IDs to check
         video_ids_to_check = observe_args.observe_video_ids
         
-        # Build a mapping of video_id to index for sorting
+        # Build a mapping of video_id to date for sorting
         video_date_map = {}
         for video_id, file_path, meta in videos_info:
             upload_date = meta.get("upload_date", "")
@@ -301,6 +518,12 @@ def run_observation(
             key=lambda vid: video_date_map.get(vid, ""),
             reverse=True
         )
+        
+        # If we have candidate phrases from last run, use them for filtering
+        candidate_phrase_set = set()
+        if last_run_phrases:
+            for n in last_run_phrases:
+                candidate_phrase_set.update(last_run_phrases[n].keys())
         
         # Process each video
         for video_id in sorted_videos:
@@ -317,9 +540,6 @@ def run_observation(
                 continue
             
             # For each phrase in this video, check if it appears in previous videos
-            # We need to compute z-scores for the phrases
-            # For observation, we'll use a simplified scoring approach
-            
             # Get all previous videos (uploaded before this one)
             target_date = video_date_map.get(video_id, "")
             previous_videos = [
@@ -329,15 +549,21 @@ def run_observation(
             
             print(f"  Previous videos: {len(previous_videos)}")
             
-            # Collect all phrases from this video
+            # Collect all phrases from this video that are in our candidate set
             all_video_phrases = {}
             for n in ngram_sizes:
                 if n in video_ngrams:
                     for phrase, count in video_ngrams[n].items():
+                        # Only track phrases that were in the focus channel's candidates
+                        if candidate_phrase_set and phrase not in candidate_phrase_set:
+                            continue
                         all_video_phrases[phrase] = count
             
+            if not all_video_phrases:
+                print(f"  No candidate phrases found in this video")
+                continue
+            
             # For each phrase, check if it appears in previous videos
-            # We'll do this by loading the previous videos' content
             phrases_in_prev = defaultdict(list)  # phrase -> list of (video_id, count)
             
             for prev_video_id in previous_videos:
@@ -353,9 +579,6 @@ def run_observation(
                                     phrases_in_prev[phrase].append((prev_video_id, count))
             
             # Now compute a simple z-score-like metric for each phrase
-            # We'll use: (count_in_this_video - avg_count_in_prev) / std_count_in_prev
-            # For phrases not in previous videos, we'll assign a high score
-            
             scored_phrases = []
             for phrase, current_count in all_video_phrases.items():
                 prev_counts = [count for _, count in phrases_in_prev.get(phrase, [])]
