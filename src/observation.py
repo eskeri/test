@@ -15,7 +15,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from .token_loading import _input_root, _load_metadata, _filter_files_by_metadata, stream_tokens
+from .token_loading import _input_root, _load_metadata, _filter_files_by_metadata, stream_tokens, load_tokens_per_video
 from .utils import tokenize, extract_video_id
 from .scoring import PhraseScore, compute_scores, partition_scores
 from .candidate_cache import (
@@ -75,6 +75,73 @@ def _load_channel_videos_info(base_dir: Path, channel: str, args: argparse.Names
     return result
 
 
+def _compute_video_ngrams_with_limit(
+    base_dir: Path,
+    channel: str,
+    video_id: str,
+    ngram_sizes: List[int],
+    args: argparse.Namespace,
+    max_contribute: int,
+    nlp=None,
+) -> Optional[Dict[int, Dict[str, int]]]:
+    """Compute n-gram counts for a single video with per-video contribution limit.
+    
+    This respects the --focus-video-contribute limit when computing n-grams.
+    
+    Args:
+        base_dir: Base directory
+        channel: Channel name
+        video_id: Video ID
+        ngram_sizes: List of n-gram sizes to compute
+        args: Arguments for filtering
+        max_contribute: Maximum count each video can contribute per phrase
+        nlp: Lemmatizer (optional)
+        
+    Returns:
+        Dict of {n: {phrase: count}} or None if video not found
+    """
+    txt_dir = _input_root(base_dir) / channel / "txt_files"
+    if not txt_dir.exists():
+        return None
+    
+    # Find the video file
+    video_file = txt_dir / f"{video_id}.txt"
+    if not video_file.exists():
+        # Try other formats
+        for f in txt_dir.glob("*.txt"):
+            if extract_video_id(f.name) == video_id:
+                video_file = f
+                break
+        else:
+            return None
+    
+    try:
+        text = video_file.read_text(encoding="utf-8")
+        tokens = tokenize(text)
+        
+        if len(tokens) < args.min_tokens_per_file:
+            return None
+        
+        # Count n-grams with per-video contribution limit
+        result = {n: Counter() for n in ngram_sizes}
+        
+        for n in ngram_sizes:
+            if n == 1:
+                # For unigrams, cap each phrase at max_contribute
+                unigram_counts = Counter(tokens)
+                for phrase, count in unigram_counts.items():
+                    result[1][phrase] = min(count, max_contribute)
+            else:
+                # For n-grams, cap each phrase at max_contribute
+                for i in range(len(tokens) - n + 1):
+                    phrase = " ".join(tokens[i:i + n])
+                    result[n][phrase] = min(result[n].get(phrase, 0) + 1, max_contribute)
+        
+        return result
+    except Exception:
+        return None
+
+
 def _compute_video_ngrams(
     base_dir: Path,
     channel: str,
@@ -82,6 +149,7 @@ def _compute_video_ngrams(
     ngram_sizes: List[int],
     args: argparse.Namespace,
     nlp=None,
+    max_contribute: Optional[int] = None,
 ) -> Optional[Dict[int, Dict[str, int]]]:
     """Compute n-gram counts for a single video.
     
@@ -92,10 +160,16 @@ def _compute_video_ngrams(
         ngram_sizes: List of n-gram sizes to compute
         args: Arguments for filtering
         nlp: Lemmatizer (optional)
+        max_contribute: Optional per-video contribution limit
         
     Returns:
         Dict of {n: {phrase: count}} or None if video not found
     """
+    if max_contribute is not None:
+        return _compute_video_ngrams_with_limit(
+            base_dir, channel, video_id, ngram_sizes, args, max_contribute, nlp
+        )
+    
     txt_dir = _input_root(base_dir) / channel / "txt_files"
     if not txt_dir.exists():
         return None
@@ -201,6 +275,9 @@ def run_observation(
     if observe_args.observe_video_ids:
         print(f"\n[Checking phrases across videos...]")
         
+        # Get max_contribute from focus_video_contribute
+        max_contribute = getattr(args, "focus_video_contribute", None)
+        
         # Load all videos for this channel
         videos_info = _load_channel_videos_info(base_dir, channel, args)
         if not videos_info:
@@ -229,9 +306,10 @@ def run_observation(
         for video_id in sorted_videos:
             print(f"\n--- Video: {video_id} ---")
             
-            # Compute n-grams for this video
+            # Compute n-grams for this video with per-video contribution limit
             video_ngrams = _compute_video_ngrams(
-                base_dir, channel, video_id, ngram_sizes, args, nlp
+                base_dir, channel, video_id, ngram_sizes, args, nlp,
+                max_contribute=max_contribute
             )
             
             if video_ngrams is None:
@@ -264,7 +342,8 @@ def run_observation(
             
             for prev_video_id in previous_videos:
                 prev_ngrams = _compute_video_ngrams(
-                    base_dir, channel, prev_video_id, ngram_sizes, args, nlp
+                    base_dir, channel, prev_video_id, ngram_sizes, args, nlp,
+                    max_contribute=max_contribute
                 )
                 if prev_ngrams:
                     for n in ngram_sizes:
